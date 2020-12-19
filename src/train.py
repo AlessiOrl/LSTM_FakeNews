@@ -5,15 +5,15 @@ from functools import partial
 from pprint import pprint
 
 from dataset import DatasetLSTM
-from models import FakenewsLSTM, F1
+from models import FakenewsLSTM
 import gensim
 import torch.nn.functional as F
 from tqdm.auto import tqdm
+from pytorch_lightning.metrics import F1
 
-
-fpath = "data/fake.token"
-tpath = "data/true.token"
-glove = "/home/orland/Personal/Project/FDS/Final/data/glove.6B.100d.word2vec.bin"
+fpath = "../data/fake.token"
+tpath = "../data/true.token"
+glove = "../data/glove.6B.100d.word2vec.bin"
 
 
 def get_sent_vect(mx=-1):
@@ -39,11 +39,43 @@ def get_sent_vect(mx=-1):
 
     return false, true
 
+def get_art_vect(mx=-1):
+    def readfile(p, m):
+        l = []
+        with open(p, "r") as file:
+            article = []
+            aid = 0
+            for token in file:
+                if m > 0 and len(l) >= (m // 2): return l
+                t = token.split("\t")
+                caid = int(t[1]) #current article id
+                if caid != aid:
+                    l.append(article)
+                    article = [t[4]]
+                    aid = caid
+                else:
+                    article.append(t[4])
+        return l
+    
+    false = readfile(fpath, mx)
+    true = readfile(tpath, mx)
+
+    return false, true
+
+
 
 # lista di frasi #con glove no punct
+def binary_acc(y_pred, y_test):
+    y_pred_tag = torch.round(torch.sigmoid(y_pred))
+
+    correct_results_sum = (y_pred_tag == y_test).sum().float()
+    acc = correct_results_sum/y_test.shape[0]
+    acc = torch.round(acc * 100)
+    
+    return acc
 
 
-def train(fake, true, batch_size, embeddings_file):
+def train(fake, true, batch_size, embeddings_file, epochs=1):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print("Device:", device)
     word_vec = gensim.models.KeyedVectors.load_word2vec_format(
@@ -58,7 +90,6 @@ def train(fake, true, batch_size, embeddings_file):
         "num_workers": 0,
         "collate_fn": partial(DatasetLSTM.generate_batch, vocab = data.vocab ),
     }
-    epochs = 30
 
     # split data
     train_len = int((80 * len(data)) // 100.0)
@@ -72,29 +103,38 @@ def train(fake, true, batch_size, embeddings_file):
     # train step
     model = FakenewsLSTM(word_vec).to(device)
     optimizer = optim.Adam(model.parameters())
-    criterion = nn.CrossEntropyLoss(ignore_index=0).to(device)
-    f1 = F1().to(device)
+    criterion = nn.BCEWithLogitsLoss().to(device)
+    f1 = F1(num_classes=1).to(device)
     for epoch in range(epochs):
         # train step
         train_loop = tqdm(train_generator)
         train_loop.set_description("Epoch {}/{}".format(epoch + 1, epochs))
-        train_loss = train_step(criterion, device, train_loop, model, optimizer)
+        train_loss, train_acc = train_step(criterion, device, train_loop, model, optimizer)
         # val step
         val_loop = tqdm(val_generator)
         val_loop.set_description("Epoch {}/{}".format(epoch + 1, epochs))
         val_loss, val_f1 = val_step(model, criterion,f1, device, train_loop)
+        
         # print total loss
         epoch_loss = train_loss / len(train_generator)
+        epoch_acc =  train_acc / len(train_generator)
+
         val_epoch_loss = val_loss / len(val_generator)
-        val_f1_mean =  val_f1 / len(val_generator)
+        val_epoch_f1 = val_f1 / len(val_generator)
+
         print("train loss: {:.3}".format(epoch_loss))
+        print("train acc: {:.3}".format(epoch_acc))
+
         print("val loss: {:.3}".format(val_epoch_loss))
-        print("val f1: {:.3}".format(val_f1_mean))
+        print("val f1: {:.3}".format(val_epoch_f1))
+
+
+        
 
 
 def train_step(criterion, device, loop, model, optimizer):
     # Training
-    train_loss = 0.0
+    train_loss = train_acc =  0.0
     for i, batch in enumerate(loop):
         # Transfer to GPU
         x, y = batch
@@ -105,12 +145,16 @@ def train_step(criterion, device, loop, model, optimizer):
         # forward + backward + optimize
         outputs = model(x)
         loss = criterion(outputs, y.float().unsqueeze(1))
+        acc = binary_acc(outputs, y.float().unsqueeze(1))
+
         loss.backward()
         optimizer.step()
 
         train_loss += loss.item()
+        train_acc += acc.item()
         loop.set_postfix(loss=loss.item())
-    return train_loss
+        loop.set_postfix(acc=acc.item())
+    return train_loss, train_acc
 
 def val_step(model, criterion, f1, device, loop):
     val_loss = val_f1 = 0.0
@@ -124,13 +168,14 @@ def val_step(model, criterion, f1, device, loop):
             # forward + backward + optimize
             outputs = model(x)
             loss = criterion(outputs, y.float().unsqueeze(1))
-            f1_score = f1(outputs, y)
-        val_f1 += f1_score.item()
+            f1_ = f1(outputs, y.float().unsqueeze(1))
+        
         val_loss += loss.item()
+        val_f1 += f1_.item()
         loop.set_postfix(loss=loss.item())
-        loop.set_postfix(f1=f1_score.item())
+        loop.set_postfix(f1=f1_.item())
     return val_loss, val_f1
 
 
-fake, true = get_sent_vect()
-train(fake, true, 64, glove)
+fake, true = get_art_vect(20000)
+train(fake, true, 32 , glove, epochs=5)
